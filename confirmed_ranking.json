@@ -1,22 +1,27 @@
-[
-  {
-    "id": 4,
-    "title": "Async IO in Python Explained"
-  },
-  {
-    "id": 2,
-    "title": "Advanced Selenium Scraping"
-  },
-  {
-    "id": 3,
-    "title": "Telegram Bot Design Patterns"
-  },
-  {
-    "id": 1,
-    "title": "How to Train Your Python"
-  },
-  {
-    "id": 5,
-    "title": "Deploy Python Apps on Cloud"
-  }
-]
+{
+  "ranking": [
+    {
+      "id": 1,
+      "title": "How to Train Your Python"
+    },
+    {
+      "id": 4,
+      "title": "Async IO in Python Explained"
+    },
+    {
+      "id": 5,
+      "title": "Deploy Python Apps on Cloud"
+    }
+  ],
+  "deleted": [
+    {
+      "id": 2,
+      "title": "Advanced Selenium Scraping"
+    },
+    {
+      "id": 3,
+      "title": "Telegram Bot Design Patterns"
+    }
+  ],
+  "save_for_midnight": []
+}
