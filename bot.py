@@ -1,4 +1,5 @@
 import json
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -6,9 +7,8 @@ from telegram.ext import (
 
 ARTICLES_FILE = "articles.json"
 RESULT_FILE = "confirmed_ranking.json"
-
-AUTO_CONFIRM_TIME = 30        # seconds for test
-USER_INACTIVITY_TIME = 15     # seconds for test
+AUTO_CONFIRM_TIME = 30  # seconds for test
+USER_INACTIVITY_TIME = 15  # seconds for test
 
 def load_articles():
     with open(ARTICLES_FILE, "r", encoding="utf-8") as f:
@@ -84,53 +84,89 @@ def build_tweak_keyboard(articles, picked, deleted, midnight):
         ])
     return InlineKeyboardMarkup(buttons)
 
-def clear_jobs_and_pointers(context):
-    for key in ["auto_confirm_job", "countdown_job", "tweak_timer_job"]:
+def clear_panel_jobs(context, keep=None):
+    # keep: list of job keys to keep, e.g. ['countdown_job']
+    all_job_keys = ["auto_confirm_job", "countdown_job", "tweak_timer_job"]
+    for key in all_job_keys:
+        if keep and key in keep:
+            continue
         job = context.chat_data.get(key)
         if job:
-            try:
-                job.schedule_removal()
-            except Exception:
-                pass
-            del context.chat_data[key]
-    for key in ["panel_message_id", "tweaking_message_id", "last_confirm_message_id"]:
-        if key in context.chat_data:
+            try: job.schedule_removal()
+            except: pass
             del context.chat_data[key]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    clear_jobs_and_pointers(context)
+    clear_panel_jobs(context)
     articles = load_articles()
-    context.user_data.clear()
-    context.user_data["articles"] = articles
-    context.user_data["picked"] = {}
-    context.user_data["deleted"] = []
-    context.user_data["midnight"] = []
-    await show_confirm_panel(update.effective_chat.id, context, articles, AUTO_CONFIRM_TIME)
+    context.chat_data.clear()
+    context.chat_data["articles"] = articles
+    context.chat_data["picked"] = {}
+    context.chat_data["deleted"] = []
+    context.chat_data["midnight"] = []
+    await show_confirm_panel(update.effective_chat.id, context, articles, AUTO_CONFIRM_TIME, reset_message=True)
 
-async def show_confirm_panel(chat_id, context, articles, countdown):
-    clear_jobs_and_pointers(context)
+async def show_confirm_panel(chat_id, context, articles, countdown, reset_message=False):
+    # When opening confirm panel, kill only tweak count jobs, keep any home panel jobs alive
+    clear_panel_jobs(context, keep=['countdown_job','auto_confirm_job'])
+
     context.chat_data["main_countdown"] = countdown
+
     text = f"**Current ranking:**\n{original_ranking_text(articles)}\n\n" \
            f"✅ Confirm auto-sends in {countdown}s..."
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Confirm", callback_data="confirm_original"),
          InlineKeyboardButton("🔄 Tweak Ranking", callback_data="start_tweak")]
     ])
-    msg = await context.bot.send_message(
-        chat_id=chat_id, text=text, reply_markup=keyboard, parse_mode="Markdown"
-    )
-    context.chat_data["panel_message_id"] = msg.message_id
+
+    # Detect whether to edit or send (on inactivity, may want to create new message)
+    if not reset_message and "active_message_id" in context.chat_data:
+        msg_id = context.chat_data["active_message_id"]
+        try:
+            msg = await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text=text, reply_markup=keyboard, parse_mode="Markdown"
+            )
+            # Store to ensure active id stays
+            context.chat_data["active_message_id"] = msg_id
+        except Exception:
+            # Fallback: send new message and track id
+            msg = await context.bot.send_message(
+                chat_id=chat_id, text=text, reply_markup=keyboard, parse_mode="Markdown"
+            )
+            context.chat_data["active_message_id"] = msg.message_id
+    else:
+        msg = await context.bot.send_message(
+            chat_id=chat_id, text=text, reply_markup=keyboard, parse_mode="Markdown"
+        )
+        context.chat_data["active_message_id"] = msg.message_id
+
+    msg_id = context.chat_data["active_message_id"]
+
+    # Cancel old home panel jobs (if any), then create fresh ones for auto-confirm and countdown
     jq = context.application.job_queue
-    countdown_job = jq.run_repeating(update_main_countdown,
-                                     interval=1, first=1,
-                                     chat_id=chat_id)
+
+    if "countdown_job" in context.chat_data:
+        old_job = context.chat_data["countdown_job"]
+        try: old_job.schedule_removal()
+        except: pass
+        del context.chat_data["countdown_job"]
+    countdown_job = jq.run_repeating(update_main_countdown, interval=1, first=1, chat_id=chat_id)
     context.chat_data["countdown_job"] = countdown_job
+
+    if "auto_confirm_job" in context.chat_data:
+        old_job = context.chat_data["auto_confirm_job"]
+        try: old_job.schedule_removal()
+        except: pass
+        del context.chat_data["auto_confirm_job"]
     job = jq.run_once(main_auto_confirm, countdown, chat_id=chat_id)
     context.chat_data["auto_confirm_job"] = job
 
 async def update_main_countdown(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
-    countdown = context.chat_data.get("main_countdown", AUTO_CONFIRM_TIME)
+    if "main_countdown" not in context.chat_data:
+        context.chat_data["main_countdown"] = AUTO_CONFIRM_TIME
+    countdown = context.chat_data["main_countdown"]
     countdown -= 1
     context.chat_data["main_countdown"] = countdown
     articles = context.chat_data.get("articles", load_articles())
@@ -140,20 +176,30 @@ async def update_main_countdown(context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✅ Confirm", callback_data="confirm_original"),
          InlineKeyboardButton("🔄 Tweak Ranking", callback_data="start_tweak")]
     ])
-    msg_id = context.chat_data.get("panel_message_id")
+    msg_id = context.chat_data.get("active_message_id")
     if msg_id:
         try:
             await context.bot.edit_message_text(
-                text=text, chat_id=chat_id, message_id=msg_id, reply_markup=keyboard, parse_mode="Markdown"
+                text=text, chat_id=chat_id, message_id=msg_id,
+                reply_markup=keyboard, parse_mode="Markdown"
             )
         except Exception:
             pass
+    if countdown <= 0:
+        # No need to do anything, auto-confirm will fire
+
+        # Optionally, cancel the countdown job to prevent further firing
+        if "countdown_job" in context.chat_data:
+            job = context.chat_data["countdown_job"]
+            try: job.schedule_removal()
+            except: pass
+            del context.chat_data["countdown_job"]
 
 async def main_auto_confirm(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     articles = context.chat_data.get("articles", load_articles())
     save_final_result([a["id"] for a in articles], [], [], articles)
-    msg_id = context.chat_data.get("panel_message_id")
+    msg_id = context.chat_data.get("active_message_id")
     if msg_id:
         try:
             await context.bot.edit_message_text(
@@ -163,7 +209,7 @@ async def main_auto_confirm(context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
-    clear_jobs_and_pointers(context)
+    clear_panel_jobs(context)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -171,110 +217,115 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     chat_id = query.message.chat.id
     articles = context.chat_data.get("articles", load_articles())
-    # Clean up jobs/pointers for every interaction.
-    clear_jobs_and_pointers(context)
+    msg_id = context.chat_data.get("active_message_id")
+    if not msg_id:
+        return  # Safety
+
+    # On any button press, kill jobs from the *opposite* panel only
+    if data in ["start_tweak", "redo_all"]:
+        clear_panel_jobs(context, keep=['tweak_timer_job'])
+    elif data in ["confirm_original"]:
+        clear_panel_jobs(context, keep=['countdown_job','auto_confirm_job'])
+    # For tweaks, keep tweak inactivity job running
 
     if data == "confirm_original":
         save_final_result([a["id"] for a in articles], [], [], articles)
         try:
-            await query.edit_message_text("Ranking confirmed and exported! ✅")
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text="Ranking confirmed and exported! ✅",
+                reply_markup=None
+            )
         except Exception:
             pass
-        clear_jobs_and_pointers(context)
+        clear_panel_jobs(context)
         return
-    if data == "start_tweak":
-        context.user_data["picked"] = {}
-        context.user_data["deleted"] = []
-        context.user_data["midnight"] = []
-        await begin_tweaking(chat_id, context, articles)
+
+    if data == "start_tweak" or data == "redo_all":
+        context.chat_data["picked"] = {}
+        context.chat_data["deleted"] = []
+        context.chat_data["midnight"] = []
+        await begin_tweaking(chat_id, context, articles, msg_id)
         return
-    if data == "redo_all":
-        context.user_data["picked"] = {}
-        context.user_data["deleted"] = []
-        context.user_data["midnight"] = []
-        await begin_tweaking(chat_id, context, articles)
-        return
-    if data.startswith("pick:") or data.startswith("delete:") or data.startswith("midnight:"):
+
+    if data.startswith(("pick:","delete:","midnight:")):
         cmd, aid = data.split(":")
         aid = int(aid)
-        picked = context.user_data.get("picked", {})
-        deleted = context.user_data.get("deleted", [])
-        midnight = context.user_data.get("midnight", [])
-        left = [a for a in articles if a["id"] not in picked and a["id"] not in deleted and a["id"] not in midnight]
-
-        if cmd == "pick":
-            if aid not in picked:
-                picked[aid] = len(picked) + 1
-        elif cmd == "delete":
-            if aid not in deleted:
-                deleted.append(aid)
-        elif cmd == "midnight":
-            if aid not in midnight:
-                midnight.append(aid)
-
-        context.user_data["picked"] = picked
-        context.user_data["deleted"] = deleted
-        context.user_data["midnight"] = midnight
+        picked = context.chat_data.get("picked", {})
+        deleted = context.chat_data.get("deleted", [])
+        midnight = context.chat_data.get("midnight", [])
+        if cmd == "pick" and aid not in picked:
+            picked[aid] = len(picked) + 1
+        elif cmd == "delete" and aid not in deleted:
+            deleted.append(aid)
+        elif cmd == "midnight" and aid not in midnight:
+            midnight.append(aid)
+        context.chat_data["picked"] = picked
+        context.chat_data["deleted"] = deleted
+        context.chat_data["midnight"] = midnight
 
         reset_tweak_timer(chat_id, context)
 
-        # Now check if all are handled
         all_handled = (len(picked) + len(deleted) + len(midnight)) == len(articles)
         if all_handled:
-            # Show summary and confirmation panel
             final_text = final_confirm_text(articles, picked, deleted, midnight)
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Confirm", callback_data="confirm_tweak"),
                  InlineKeyboardButton("🔄 Do-over", callback_data="redo_all")]
             ])
-            msg = await context.bot.send_message(
-                chat_id=chat_id, text=final_text, reply_markup=keyboard, parse_mode="Markdown"
-            )
-            context.chat_data["last_confirm_message_id"] = msg.message_id
-            cancel_tweak_timer(context)
-            return
-        else:
-            try:
-                await query.edit_message_text(
-                    tweaking_status_text(articles, picked, deleted, midnight),
-                    reply_markup=build_tweak_keyboard(articles, picked, deleted, midnight),
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
-        return
-    if data == "confirm_tweak":
-        picked = context.user_data.get("picked", {})
-        deleted = context.user_data.get("deleted", [])
-        midnight = context.user_data.get("midnight", [])
-        save_final_result(
-            sorted(picked, key=lambda x: picked[x]), deleted, midnight, articles
-        )
-        msg_id = context.chat_data.get("last_confirm_message_id")
-        if msg_id:
             try:
                 await context.bot.edit_message_text(
                     chat_id=chat_id, message_id=msg_id,
-                    text="Tweaked ranking confirmed and exported! ✅",
-                    reply_markup=None)
+                    text=final_text, reply_markup=keyboard, parse_mode="Markdown"
+                )
             except Exception:
                 pass
-        clear_jobs_and_pointers(context)
+            cancel_tweak_timer(context)
+            return
+        else:
+            text = tweaking_status_text(articles, picked, deleted, midnight) + "\n\n(Inactivity will reset this panel after 15 seconds)"
+            keyboard = build_tweak_keyboard(articles, picked, deleted, midnight)
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg_id,
+                    text=text, reply_markup=keyboard, parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+            return
+
+    if data == "confirm_tweak":
+        picked = context.chat_data.get("picked", {})
+        deleted = context.chat_data.get("deleted", [])
+        midnight = context.chat_data.get("midnight", [])
+        save_final_result(
+            [k for k in sorted(picked, key=lambda x: picked[x])], deleted, midnight, articles
+        )
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text="Tweaked ranking confirmed and exported! ✅",
+                reply_markup=None
+            )
+        except Exception:
+            pass
+        clear_panel_jobs(context)
         return
-    elif data.startswith("noop"):
-        pass
 
-async def begin_tweaking(chat_id, context, articles):
-    clear_jobs_and_pointers(context)
-    picked = context.user_data.get("picked", {})
-    deleted = context.user_data.get("deleted", [])
-    midnight = context.user_data.get("midnight", [])
-
+async def begin_tweaking(chat_id, context, articles, msg_id):
+    clear_panel_jobs(context, keep=['tweak_timer_job'])
+    picked = context.chat_data.get("picked", {})
+    deleted = context.chat_data.get("deleted", [])
+    midnight = context.chat_data.get("midnight", [])
     text = tweaking_status_text(articles, picked, deleted, midnight) + "\n\n(Inactivity will reset this panel after 15 seconds)"
-    msg = await context.bot.send_message(
-        chat_id=chat_id, text=text, reply_markup=build_tweak_keyboard(articles, picked, deleted, midnight), parse_mode="Markdown"
-    )
-    context.chat_data["tweaking_message_id"] = msg.message_id
+    keyboard = build_tweak_keyboard(articles, picked, deleted, midnight)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text=text, reply_markup=keyboard, parse_mode="Markdown"
+        )
+    except Exception:
+        pass
     reset_tweak_timer(chat_id, context)
 
 def reset_tweak_timer(chat_id, context):
@@ -286,26 +337,26 @@ def reset_tweak_timer(chat_id, context):
 def cancel_tweak_timer(context):
     job = context.chat_data.get("tweak_timer_job")
     if job:
-        try:
-            job.schedule_removal()
-        except Exception:
-            pass
+        try: job.schedule_removal()
+        except Exception: pass
         del context.chat_data["tweak_timer_job"]
 
 async def tweak_inactivity_timeout(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
+    msg_id = context.chat_data.get("active_message_id")
     articles = context.chat_data.get("articles", load_articles())
-    msg_id = context.chat_data.get("tweaking_message_id")
-    if msg_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=msg_id,
-                text="Tweak canceled due to inactivity. Resetting...",
-                reply_markup=None
-            )
-        except Exception:
-            pass
-    clear_jobs_and_pointers(context)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text="Tweak canceled due to inactivity. Resetting...",
+            reply_markup=None
+        )
+    except Exception:
+        pass
+
+    context.chat_data["picked"] = {}
+    context.chat_data["deleted"] = []
+    context.chat_data["midnight"] = []
     await show_confirm_panel(chat_id, context, articles, AUTO_CONFIRM_TIME)
 
 def main():
